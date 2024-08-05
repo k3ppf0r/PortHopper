@@ -8,7 +8,8 @@ Compile Environment: Windows / Linux / Mac OS / Android, Gcc
 #include <unistd.h>
 #include <signal.h>
 #include <stdint.h>
- 
+#include "encryption.h"
+
 #define BUF_LEN 8192
  
 #ifdef WIN32  //WINDOWS COMPILE
@@ -44,9 +45,7 @@ typedef int SOCKET;
  
 #endif
  
-typedef ThreadReturn (
-*Func)(void*
-);
+typedef ThreadReturn (*Func)(void*);
  
 FILE* ph_log = NULL;
 FILE* ph_hex = NULL;
@@ -64,7 +63,7 @@ void ctrl_c(int32_t i)
 }
  
  
-int in_createthread(Func run,void* data)
+int in_createthread(Func run,ThreadArgs** data)
 {
 #ifdef WIN32
   HANDLE h = CreateThread(NULL,0,run,data,0,NULL);
@@ -79,12 +78,15 @@ int in_createthread(Func run,void* data)
   delay(5);
   return 0;
 }
- 
-ThreadReturn  in_data_tran(void* p)
+
+ThreadReturn in_data_tran(ThreadArgs** threadArgs)
 {
   SOCKET t[2];
-  t[0]=((int*)p)[0];
-  t[1]=((int*)p)[1];
+  SSL* ssl[2];
+  t[0] = threadArgs[0]->data;
+  t[1] = threadArgs[1]->data;
+  ssl[0] = (SSL *)threadArgs[0]->ssl;
+  ssl[1] = (SSL *)threadArgs[1]->ssl;
   struct sockaddr_in sa[2];
   const unsigned char* ip[2];
   unsigned short port[2];
@@ -116,15 +118,15 @@ ThreadReturn  in_data_tran(void* p)
     {
       if(FD_ISSET(t[i],&check_list))
       {
-        int len = recv(t[i],buf,BUF_LEN,0);
-        if(len>0 && send(t[i==0],buf,len,0)>0 )
+        int len = ssl_read(ssl[i], buf, BUF_LEN);
+        if(len>0 && ssl_write(ssl[i == 0 ? 1 : 0], buf, len) > 0 )
         {
           total_byte += len;
           char out[100];
           sprintf(out,"\n[+]  Send <Total %d>: %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d,  %d Bytes\n",
               total_connect,ip[i][0],ip[i][1],ip[i][2],ip[i][3],port[i],ip[i==0][0],ip[i==0][1],ip[i==0][2],ip[i==0][3],port[i==0],len);
           fprintf(stdout,"%s",out);fflush(stdout);
-          if(ph_log)fprintf(ph_log,"%s",out),fflush(ph_log);
+          if(ph_log)fprintf(ph_log,"%s",out);fflush(ph_log);
           if(ph_text)
           {
             fprintf(ph_text,"\n%s\n",out);
@@ -266,6 +268,12 @@ int ph_listen(unsigned short port1,unsigned short port2)
   for(i=0; i<2; ++i)
   {
     s[i] = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+    // set SO_REUSEADDR  
+    int opt = 1;  
+    if (setsockopt(s[i], SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {  
+        perror("setsockopt");  
+        exit(EXIT_FAILURE);  
+    } 
     if(s[i]!=-1)
     {
       fprintf(stdout,"\n[+]  Create Socket %d Successed\n",i+1);fflush(stdout);
@@ -312,22 +320,26 @@ int ph_listen(unsigned short port1,unsigned short port2)
   }
   i = 0;
   SOCKET t[2];
+  SSL* ssl[2];
+  ThreadArgs* threadArgs[2]; 
   socklen_t sz = sizeof(sa);
   while(1)
   {
     fprintf(stdout,"\n[+]  Waiting Connect On Port %u\n",p[i]);fflush(stdout);
     if(ph_log)fprintf(ph_log,"\n[+]  Waiting Connect On Port %u\n",p[i]),fflush(ph_log);
     t[i] = accept(s[i],(struct sockaddr*)&sa,&sz);
-    const unsigned char 
-*ip = (unsigned char*
-)&sa.sin_addr.s_addr;
+    ssl[i] = sync_initialize_ssl("cert.pem", "key.pem", i==0 ? SSL_MODE_SERVER : SSL_MODE_CLIENT, t[i]); 
+    threadArgs[i]->ssl  = ssl[i];
+    threadArgs[i]->data  = t[i];
+    const unsigned char *ip = (unsigned char*)&sa.sin_addr.s_addr;
     if(t[i]!=-1)
     {
       fprintf(stdout,"\n[+]  Connect From %d.%d.%d.%d:%d On Port %d\n",ip[0],ip[1],ip[2],ip[3],htons(sa.sin_port),p[i]);fflush(stdout);
       if(ph_log)fprintf(ph_log,"\n[+]  Connect From %d.%d.%d.%d:%d On Port %d\n",ip[0],ip[1],ip[2],ip[3],htons(sa.sin_port),p[i]),fflush(ph_log);
       if(i==1)
       {
-        in_createthread(in_data_tran,t);
+
+        in_createthread(in_data_tran,threadArgs);
       }
       i = (i==0);
     }
@@ -431,15 +443,18 @@ int ph_tran(unsigned short port1,const char* ip2_str,unsigned short port2)
   return 0;
 }
  
+int ph_cmd(unsigned short port1,const char* ip2_str,unsigned short port2){
+
+}
 void help(const char* name)
 {
   fprintf(stdout,"\nUsage of Packet Transmit:\n");
-  fprintf(stdout,"  %s -<l|t|s> <option> [<-log|-hex|-text> file] \n",name);
+  fprintf(stdout,"  %s -<listen|tran|slave> <option> [<-log|-hex|-text> file] \n",name);
   fprintf(stdout,"  %s -about\n\n",name);
   fprintf(stdout,"[options:]\n");
-  fprintf(stdout,"  -l <local port1>  <local port2>\n");
-  fprintf(stdout,"  -t   <local port>   <remote host>  <remote port>\n");
-  fprintf(stdout,"  -s  <remote host1> <remote port1> <remote host2> <remote port2>\n\n");
+  fprintf(stdout,"  -listen <local port1>  <local port2>\n");
+  fprintf(stdout,"  -tran   <local port>   <remote host>  <remote port>\n");
+  fprintf(stdout,"  -slave  <remote host1> <remote port1> <remote host2> <remote port2>\n\n");
   fprintf(stdout,"  -hex   : hex mode data dump\n");
   fprintf(stdout,"  -text  : text mode data dump\n");
   fprintf(stdout,"  -log   : save transfer log\n\n");
@@ -477,12 +492,13 @@ void setfile(FILE** fp,const char*file)
  
 int main_func(int argc,char**argv)
 {
+
   if (argc<2)
   {
     help(argv[0]);
     return 0;
   }
-  const char* command[] = {"-a","-l","-s","-t"};
+  const char* command[] = {"-about","-listen","-slave","-tran","-cmd"};
   int32_t i,s = sizeof(command)/sizeof(*command);
   for (i=0; i<s; i++)
   {
@@ -600,6 +616,7 @@ int main_func(int argc,char**argv)
     case 1:ph_listen(port1,port2);break;
     case 2:ph_slave(addr1,port1,addr2,port2);break;
     case 3:ph_tran(port1,addr2,(uint16_t)port2);break;
+    case 4:ph_cmd(port1,addr2,(uint16_t)port2);break;
     default:break;
   }
   return 0;
@@ -610,13 +627,17 @@ int main_func(int argc,char**argv)
 int main(int argc,char** argv)
 {
   signal(SIGINT,ctrl_c);
-  SOCKET_INIT
-    int ret = main_func(argc,argv);
+  // SOCKET_INIT
+  //   int ret = main_func(argc,argv);
+    SOCKET_INIT
+  char *params[] = {"PortHopper", "-listen", "1235","1236"};
+  int argcc = sizeof(params) / sizeof(params[0]);
+  int ret = main_func(argcc,params);
 #ifdef COMMAND_MODE
   while(1)
   {
     char input_buf[BUF_LEN]={0};
-    char *argv_list[ARGC_MAXCOUNT]={"lcx"};
+    char *argv_list[ARGC_MAXCOUNT]={"PortHopper"};
     printf(">");
     int argc_count = 1;
     int flag = 0;
